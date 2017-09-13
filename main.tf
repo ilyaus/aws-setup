@@ -5,7 +5,44 @@ provider "aws " {
 
 # IAM
 # s3_access_key
+resource "aws_iam_instance_profile" "s3_access" {
+  name = "s3_access"
+  role = ["${aws_iam_role.s3_access_name}"]
+}
 
+resource "aws_iam_role_policy" "s3_access_policy" {
+  name = "s3_access_policy"
+  role = "${aws_iam_role.s3_access.id}"
+  policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+}
+
+resource "aws_iam_role" "s3_access" {
+  name = "s3_access"
+  assume_role_policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    "Action": "sts:AssumeRole",
+    "Principle": {
+      "Service": "ec2.amazonaws.com"
+    },
+    "Effect": "Allow",
+    "Sid": ""
+  ]
+}
+EOF
+}
 # VPC
 resource "aws_vpc " "vpc " {
   cidr_block = "10.1.0.0/16 "
@@ -68,6 +105,26 @@ resource "aws_subnet " "private2 " {
   tags{
    Name = "private2 "
  }
+}
+
+# Create S3 VPC endpoint
+resource "aws_vpc_endpoint" "private-s3" {
+  vpc_id = "${aws_vpc.vpc.id}"
+  service_name = "com.amazonaws.${var.aws_region}.s3"
+  route_table_ids = [
+    "${aws_vpc.vpc.main_route_table_id}",
+    "${aws_route_table.public.id}"
+  ]
+  policy = <<POLICY
+{
+  "Statement": [
+    "Action": "*",
+    "Effect": "Allow",
+    "Resource": "*",
+    "Principle": "*"
+  ]
+}
+POLICY
 }
 
 # RDS-1
@@ -227,13 +284,80 @@ resource "aws_db_instance " "db " {
   db_subnet_group_name = "${aws_db_subnet_group.rds_subnetgroup.name}"
   vpc_security_group_ids = ["${aws_security_group.RDS.id}"]
 }
+
 # S3 code bucket
+resource "aws_s3_bucket" "code" {
+  bucket = "${var.domain_name}_code3214"
+  acl = "private"
+  force_destroy = true
+  tags {
+    Name = "CodeBucket"
+  }
+}
 
 # Compute
+
 # Key Pair
+resource "aws_key_pair" "auth" {
+  key_name = "${var.key_name}"
+  public_key = "${file(var.public_key_path)}"
+}
+
 # Dev Server
+resource "aws_instance" "dev" {
+  instance_type = "${var.dev_instance_type}"
+  ami = "${var.dev_ami}"
+  tags {
+    Name = "dev"
+  }
+
+  key_name = "${aws_key_pair.auth.id}"
+  vpc_security_group_ids = ["${aws_security_group.public.id}"]
+  iam_instance_profile "${aws_iam_instance_profile.s3_access.id}"
+  subnet_id = "${aws_subnet.public.id}"
+
+
+  provisioner "local-exec" {
+    command = "cat <<EOF > aws_hosts
+[dev]
+${aws_instance.dev.public_ip}
+[dev:vars]
+s3code=${aws_s3_bucket.code.bucket}
+EOF"
+  }
+
+  provisioner "local-exec" {
+    command = "sleep 6m && ansible-playbook -i aws_hosts wordpress.yml"
+  }
+
 # - ansible playbook
 # Load balancer
+resource "aws_elb" "prod" {
+  name = "${var.domain_name}-prod-elb"
+  subnets = ["${aws_subnet.private1.id}", "${aws_subnet.private2.id}"]
+  security_groups = ["${aws_security_group.public.id}"]
+  listener {
+    instance_port = 80
+    instance_protocol = "http"
+    lb_port = 80
+    lb_protocol = "http"
+  }
+  health_check {
+    healthy_threshold = "${var.elb_healthy_threshold}"
+    unhealthy_threshold = "${var.elb_unhealthy_threshold}"
+    timeout = "${var.elb_timeout}"
+    target = "HTTP:80/"
+    interval = "${var.elb_interval}"
+  }
+  cross_zone_load_balancing = true
+  idle_timeout = 400
+  connection_draining = true
+  connection_draining_timeout = 400
+  tags {
+    Name = "${var.domain_name}-prod-elb"
+  }
+}
+
 # AMI from dev instance
 # Launch configuration
 # aws_region
